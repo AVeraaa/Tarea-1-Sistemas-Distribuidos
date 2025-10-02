@@ -1,0 +1,65 @@
+services:
+  storage:
+    image: postgres:13
+    container_name: postgres_db
+    restart: always
+    environment:
+      - POSTGRES_USER=myuser
+      - POSTGRES_PASSWORD=mypassword
+      - POSTGRES_DB=yahoo_answers
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+
+  db-loader:
+    build: ./db-loader
+    container_name: db_loader_service
+    depends_on:
+      - storage
+    volumes:
+      - ./data:/app/../data 
+
+  cache-db:
+    image: redis:7
+    container_name: redis_cache
+    restart: always
+    ports:
+      - "6379:6379"
+
+  llm-module:
+    build: ./llm-module
+    container_name: llm_service
+    restart: always
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      storage:
+        condition: service_started
+      db-loader:
+        condition: service_completed_successfully
+
+  cache-logic:
+    build: ./cache
+    container_name: cache_service
+    restart: always
+    ports:
+      - "5000:5000"
+    environment: 
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - cache-db
+      - llm-module
+
+  traffic-generator:
+    build: ./traffic-generator
+    container_name: traffic_generator_service
+    restart: on-failure
+    environment: 
+      - TRAFFIC_DISTRIBUTION=sesgada
+    depends_on:
+      cache-logic:
+        condition: service_started
+      db-loader:
+        condition: service_completed_successfully
