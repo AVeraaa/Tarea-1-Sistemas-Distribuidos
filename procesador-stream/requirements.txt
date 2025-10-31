@@ -1,0 +1,4 @@
+apache-flink==1.18.0
+psycopg2-binary
+google-generativeai
+spacy

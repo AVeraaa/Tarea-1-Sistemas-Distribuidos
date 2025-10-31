@@ -1,2 +1,5 @@
-requests
 psycopg2-binary
+requests
+pandas
+numpy
+sqlalchemy

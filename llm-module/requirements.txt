@@ -1,4 +1,9 @@
-google-generativeai
 psycopg2-binary
-flask
 spacy
+requests
+pika
+google-generativeai
+prometheus_client
+sqlalchemy
+pandas
+redis

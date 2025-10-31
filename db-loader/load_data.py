@@ -1,95 +1,87 @@
 import os
 import time
-import psycopg2
 import pandas as pd
+import psycopg2
+from psycopg2 import OperationalError
 
-DB_NAME = "yahoo_answers"
-DB_USER = "myuser"
-DB_PASS = "mypassword"
-DB_HOST = "storage"
-DB_PORT = "5432"
+DATA_PATH = '/data/test.csv'
 
 
 def wait_for_db():
-    """Espera a que la base de datos esté lista para aceptar conexiones."""
-    retries = 10
-    wait_time = 5
-    for i in range(retries):
-        try:
-            conn = psycopg2.connect(
-                dbname=DB_NAME, user=DB_USER, password=DB_PASS, host=DB_HOST, port=DB_PORT
-            )
-            conn.close()
-            print("¡La base de datos está lista!")
-            return True
-        except psycopg2.OperationalError:
-            print(
-                f"La base de datos no está lista. Reintentando en {wait_time} segundos... ({i+1}/{retries})")
-            time.sleep(wait_time)
-    print("No se pudo conectar a la base de datos después de varios intentos.")
-    return False
-
-
-def setup_database():
-    """
-    Se conecta a la base de datos, crea la tabla si no existe,
-    y carga los datos desde el CSV.
-    """
-    if not wait_for_db():
-        return
+    """Espera a que la base de datos PostgreSQL esté disponible."""
+    print("Esperando a que la base de datos PostgreSQL esté disponible...")
+    db_host = os.getenv('DB_HOST', 'localhost')
+    db_name = os.getenv('DB_NAME', 'yahoo_answers_db')
+    db_user = os.getenv('DB_USER', 'myuser')
+    db_pass = os.getenv('DB_PASS', 'mypassword')
 
     conn = None
-    try:
-        conn = psycopg2.connect(
-            dbname=DB_NAME, user=DB_USER, password=DB_PASS, host=DB_HOST, port=DB_PORT
-        )
-        cur = conn.cursor()
-        print("¡Conexión a la base de datos PostgreSQL exitosa!")
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS questions (
-                id SERIAL PRIMARY KEY,
-                question_title TEXT NOT NULL,
-                question_content TEXT,
-                best_answer TEXT NOT NULL,
-                llm_answer TEXT,
-                score FLOAT,
-                access_count INTEGER DEFAULT 0
-            );
-        """)
-        conn.commit()
-        print("Tabla 'questions' asegurada.")
-
-        csv_path = '../data/test.csv'
-        if not os.path.exists(csv_path):
-            clean_path = os.path.abspath(csv_path)
-            print(
-                f"Error: El archivo no se encontró en la ruta esperada: {clean_path}")
-            return
-
-        print(f"Cargando datos desde {csv_path}...")
-        df = pd.read_csv(csv_path, header=None, names=[
-                         'class_index', 'question_title', 'question_content', 'best_answer'])
-
-        df = df.head(10000)
-
-        for index, row in df.iterrows():
-            cur.execute(
-                "INSERT INTO questions (question_title, question_content, best_answer) VALUES (%s, %s, %s)",
-                (row['question_title'], row['question_content'], row['best_answer'])
+    while not conn:
+        try:
+            conn = psycopg2.connect(
+                host=db_host,
+                database=db_name,
+                user=db_user,
+                password=db_pass
             )
+        except OperationalError:
+            print("Base de datos no disponible, esperando 2 segundos...")
+            time.sleep(2)
+    print("¡Conexión a la base de datos PostgreSQL exitosa!")
+    return conn
 
-        conn.commit()
-        cur.close()
-        print(f"¡Se han insertado {len(df)} registros en la base de datos!")
-        print("El servicio de carga de datos ha finalizado su trabajo.")
 
-    except Exception as e:
-        print(f"Ocurrió un error: {e}")
+def load_data(conn):
+    """Carga los datos desde el CSV a la tabla de PostgreSQL."""
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS questions (
+                    id SERIAL PRIMARY KEY,
+                    question_text TEXT,
+                    best_answer TEXT,
+                    llm_answer TEXT,
+                    score FLOAT,
+                    access_count INTEGER DEFAULT 0
+                );
+            """)
+            conn.commit()
+            print("Tabla 'questions' asegurada.")
+
+            cursor.execute("SELECT COUNT(*) FROM questions;")
+            if cursor.fetchone()[0] > 0:
+                print("La tabla 'questions' ya contiene datos. Saltando la carga.")
+                return
+
+            print(f"Cargando datos desde {DATA_PATH}...")
+
+            try:
+                df = pd.read_csv(DATA_PATH, header=None, names=[
+                                 'class', 'question_text', 'content', 'best_answer'])
+            except FileNotFoundError:
+                print(
+                    f"Error: No se pudo encontrar el archivo CSV en {DATA_PATH}.")
+                print("Verifica que el volumen en docker-compose.yml esté correcto.")
+                return
+
+            print(f"Insertando {len(df)} registros en la base de datos...")
+            for index, row in df.iterrows():
+                cursor.execute(
+                    "INSERT INTO questions (question_text, best_answer) VALUES (%s, %s)",
+                    (row['question_text'], row['best_answer'])
+                )
+            conn.commit()
+            print(f"¡Se han insertado {len(df)} registros exitosamente!")
+
+    except (Exception, psycopg2.Error) as error:
+        print("Error durante la carga de datos:", error)
     finally:
-        if conn is not None:
+        if conn:
             conn.close()
+            print("Conexión a PostgreSQL cerrada.")
 
 
 if __name__ == "__main__":
-    setup_database()
+    connection = wait_for_db()
+    if connection:
+        load_data(connection)

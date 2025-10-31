@@ -1,3 +1,7 @@
-flask
-redis
 requests
+prometheus-client
+Flask==2.1.2
+redis==4.3.4
+kafka-python==2.0.2
+prometheus-flask-exporter==0.20.0
+werkzeug==2.3.8

@@ -1,65 +1,183 @@
 services:
-  storage:
+  postgres_db:
     image: postgres:13
     container_name: postgres_db
-    restart: always
     environment:
-      - POSTGRES_USER=myuser
-      - POSTGRES_PASSWORD=mypassword
-      - POSTGRES_DB=yahoo_answers
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: yahoo_answers
     ports:
       - "5432:5432"
     volumes:
       - ./postgres-data:/var/lib/postgresql/data
 
-  db-loader:
-    build: ./db-loader
-    container_name: db_loader_service
-    depends_on:
-      - storage
-    volumes:
-      - ./data:/app/../data 
-
-  cache-db:
-    image: redis:7
+  redis_cache:
+    image: redis:6.2-alpine
     container_name: redis_cache
-    restart: always
     ports:
       - "6379:6379"
 
-  llm-module:
-    build: ./llm-module
-    container_name: llm_service
-    restart: always
-    environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - PYTHONUNBUFFERED=1
+  db_loader:
+    build:
+      context: ./db-loader
+    container_name: db_loader_service
     depends_on:
-      storage:
-        condition: service_started
-      db-loader:
-        condition: service_completed_successfully
+      - postgres_db
 
-  cache-logic:
-    build: ./cache
+  cache_service: 
+    build:
+      context: ./cache
     container_name: cache_service
-    restart: always
     ports:
       - "5000:5000"
-    environment: 
-      - PYTHONUNBUFFERED=1
+    environment:
+      REDIS_HOST: redis_cache
+      KAFKA_BROKER: kafka:29092 
     depends_on:
-      - cache-db
-      - llm-module
+      - redis_cache
+      - kafka
 
-  traffic-generator:
-    build: ./traffic-generator
+  traffic_generator: 
+    build:
+      context: ./traffic-generator
     container_name: traffic_generator_service
-    restart: on-failure
-    environment: 
-      - TRAFFIC_DISTRIBUTION=sesgada
+    environment:
+      API_URL: http://cache_service:5000
+      DB_HOST: postgres_db
+      DB_USER: myuser
+      DB_PASSWORD: mypassword
+      DB_NAME: yahoo_answers
+      TRAFFIC_DISTRIBUTION: "sesgada" 
     depends_on:
-      cache-logic:
-        condition: service_started
-      db-loader:
-        condition: service_completed_successfully
+      - cache_service
+      - postgres_db
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.0.1
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.0.1
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+  flink-jobmanager:
+    build: ./flink_job
+    container_name: flink-jobmanager
+    ports:
+      - "8081:8081" 
+    command: jobmanager
+    environment:
+      - FLINK_PROPERTIES_JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+      - FLINK_PROPERTIES_FLINK_RUNTIME_RPC_ADDRESS=flink-jobmanager
+      - FLINK_PY_EXECUTABLE=/usr/bin/python3
+    depends_on:
+      - kafka
+
+  flink-taskmanager:
+    build: ./flink_job
+    container_name: flink-taskmanager
+    depends_on:
+      - flink-jobmanager
+      - kafka
+    command: taskmanager
+    environment:
+      - FLINK_PROPERTIES_JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+      - FLINK_PROPERTIES_FLINK_RUNTIME_RPC_ADDRESS=flink-taskmanager
+      - FLINK_PROPERTIES_TASK_MANAGER_NUMBER_OF_TASK_SLOTS=2
+      - FLINK_PY_EXECUTABLE=/usr/bin/python3
+
+  flink-job-runner:
+    build:
+      context: ./flink_job
+    container_name: flink-job-runner
+    depends_on:
+      - flink-jobmanager
+    environment:
+      - FLINK_PY_EXECUTABLE=/usr/bin/python3
+    command: >
+      bash -c "
+        until curl -s http://flink-jobmanager:8081/overview | grep -q '\"taskmanagers\":'; do
+          echo 'Esperando a que Flink JobManager esté listo...';
+          sleep 5;
+        done;
+        
+        echo 'JobManager está listo. Enviando el job de PyFlink...';
+        
+        flink run -m flink-jobmanager:8081 -py /opt/flink/usrlib/main.py
+      "
+
+  storage_module: 
+    build:
+      context: ./storage-module
+    container_name: storage_module_service
+    environment:
+      KAFKA_BROKER: kafka:29092
+      DB_HOST: postgres_db
+      DB_USER: myuser
+      DB_PASSWORD: mypassword
+      DB_NAME: yahoo_answers
+    depends_on:
+      - kafka
+      - postgres_db
+
+  fallback_module: 
+    build:
+      context: ./fallback-module
+    container_name: fallback_module_service
+    environment:
+      KAFKA_BROKER: kafka:29092
+    depends_on:
+      - kafka
+
+  llm_consumer:
+    build:
+      context: ./llm_consumer
+    container_name: llm_consumer_service
+    ports: 
+      - "8001:8001"
+    environment:
+      KAFKA_BROKER: kafka:29092
+      DB_HOST: postgres_db
+      DB_USER: myuser
+      DB_PASSWORD: mypassword
+      DB_NAME: yahoo_answers
+      GEMINI_API_KEY: ${GEMINI_API_KEY} 
+    depends_on:
+      - kafka
+      - postgres_db
+
+  prometheus:
+    image: prom/prometheus:v2.22.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:7.3.1
+    container_name: grafana
+    ports:
+      - "3000:3000"
+
+  node-exporter:
+    image: prom/node-exporter:v1.0.1
+    container_name: node-exporter
+    ports:
+      - "9100:9100"

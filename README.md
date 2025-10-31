@@ -136,3 +136,63 @@ tarea1-sd/
 ├── sesgada.log           (Generado)
 └── uniforme.log          (Generado)
 ```
+
+## Arquitectura del Pipeline Asíncrono
+
+El flujo de datos sigue el siguiente camino:
+
+1.  **Ingesta:** `traffic-generator` llama (GET) al `cache-logic`.
+2.  **Producción (Cache Miss):** `cache-logic` (Productor) envía el `question_id` al tópico de Kafka `preguntas`.
+3.  **Consumo (LLM):** `llm_consumer` (Consumidor) toma el `question_id` de `preguntas`.
+4.  **Procesamiento (LLM):** `llm_consumer` consulta PostgreSQL (para obtener el texto) y llama a la API de Google Gemini.
+5.  **Bifurcación (LLM):**
+    - **Éxito:** `llm_consumer` (Productor) envía la respuesta humana y la del LLM al tópico `respuestas`.
+    - **Fallo (Rate Limit):** `llm_consumer` (Productor) envía el `question_id` al tópico `fallidas`.
+6.  **Procesamiento (Flink):** Un _job_ de PyFlink (`ScoreCalculatorJob`) consume de `respuestas`, calcula el score con `spacy`.
+7.  **Bifurcación (Flink):**
+    - **Score Alto (>= 0.8):** El _job_ produce la respuesta + score al tópico `validadas`.
+    - **Score Bajo (< 0.8):** El _job_ produce el `question_id` de vuelta al tópico `preguntas` (Feedback Loop).
+8.  **Persistencia:** `storage_module` (Consumidor) toma los mensajes de `validadas` y los guarda en PostgreSQL.
+9.  **Fallback:** `fallback_module` (Consumidor) toma los mensajes de `fallidas`, espera, y los re-encola en `preguntas`.
+10. **Monitoreo:** `prometheus` recolecta métricas de `cache-logic` y `llm_consumer`, y `grafana` las visualiza.
+
+jecución (Hard Reset)\*\*
+
+Debido a la complejidad del clúster de Flink y la caché de construcción de Docker, es crucial forzar una re-creación limpia de los contenedores:
+
+```bash
+# Paso 1: Detener y eliminar cualquier contenedor/red existente
+docker compose down
+
+# Paso 2: Construir las imágenes y forzar la re-creación de los contenedores
+docker compose up --build --force-recreate -d
+
+#Vizualización de todos los logs
+
+docker compose logs -f traffic_generator
+docker compose logs -f cache_service
+docker compose logs -f llm_consumer
+docker compose logs -f flink-job-runner
+docker compose logs -f flink-taskmanager
+docker compose logs -f flink-jobmanager
+docker compose logs -f storage_module
+docker compose logs -f prometheus
+docker compose logs -f grafana
+docker compose logs -f kafka
+docker compose logs -f postgres_db
+docker compose logs -f db_loader
+
+#Páginas accesibles
+
+#Apache Flink
+
+http://localhost:8081
+
+#Prometheus
+
+http://localhost:9090/targets
+
+#Grafana
+
+http://localhost:3000
+```
